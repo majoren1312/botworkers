@@ -1,2 +1,2 @@
 # botworkers
-workers, earn money for me.
+workers, earn money for me. (Rättelse, earn more for us)
