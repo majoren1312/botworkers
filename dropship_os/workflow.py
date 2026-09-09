@@ -7,6 +7,7 @@ from dataclasses import asdict
 from .approvals import ApprovalEngine
 from .db import Database
 from .economics import calculate_unit_economics
+from .leases import ResourceLeaseManager
 from .models import ProductOpportunity, WorkStatus
 from .shopify import ShopifyAdapter
 from .validation import validate_product
@@ -20,6 +21,7 @@ class ProductLaunchWorkflow:
         self.shopify = shopify
         self.store_id = store_id
         self.approvals = ApprovalEngine(db)
+        self.leases = ResourceLeaseManager(db)
 
     def prepare(self, opportunity: ProductOpportunity) -> dict:
         validation = validate_product(opportunity)
@@ -45,27 +47,36 @@ class ProductLaunchWorkflow:
     def execute(self, work_order_id: str) -> dict:
         if not self.approvals.is_approved(work_order_id, self.APPROVAL_TYPE):
             return {"work_order_id": work_order_id, "status": "WAIT", "reason": "human approval required"}
-        with self.db.transaction() as conn:
+        with self.db.connect() as conn:
             work = conn.execute("SELECT * FROM work_orders WHERE id=? AND store_id=?", (work_order_id, self.store_id)).fetchone()
-            if not work: raise KeyError(f"work order not found: {work_order_id}")
-            product_id = work["resource"].split(":", 1)[1]
-            product = conn.execute("SELECT * FROM products WHERE id=? AND store_id=?", (product_id, self.store_id)).fetchone()
-            if not product: raise KeyError(f"product not found: {product_id}")
-            if product["shopify_product_id"]:
-                verified = self.shopify.get_product(product["shopify_product_id"])
-                if verified and verified.status == "DRAFT" and verified.title == product["title"]:
-                    return {"work_order_id": work_order_id, "status": "PASS", "shopify_product_id": verified.id, "idempotent": True}
-            conn.execute("UPDATE work_orders SET status='RUNNING', updated_at=CURRENT_TIMESTAMP WHERE id=?", (work_order_id,))
-        created = self.shopify.create_draft_product(product["title"])
-        with self.db.transaction() as conn:
-            conn.execute("UPDATE products SET shopify_product_id=?, state='SHOPIFY_DRAFT_CREATED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (created.id, product_id))
-            conn.execute("UPDATE work_orders SET status='VERIFYING', updated_at=CURRENT_TIMESTAMP WHERE id=?", (work_order_id,))
-        verified = self.shopify.get_product(created.id)
-        passed = bool(verified and verified.id == created.id and verified.title == product["title"] and verified.status == "DRAFT")
-        with self.db.transaction() as conn:
-            conn.execute("UPDATE products SET state=?, verification_state=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", ("SHOPIFY_DRAFT_VERIFIED" if passed else "VERIFY_FAILED", "PASS" if passed else "FAILED", product_id))
-            conn.execute("UPDATE work_orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", ("PASS" if passed else "FAILED", work_order_id))
-            conn.execute("INSERT INTO execution_ledger(id, store_id, work_order_id, action, before_state, diff, after_state, verification_state, result) VALUES (?, ?, ?, 'SHOPIFY_DRAFT_CREATE', ?, ?, ?, ?, ?)", (str(uuid.uuid4()), self.store_id, work_order_id, json.dumps({"shopify_product_id": None}), json.dumps({"shopify_product_id": created.id}), json.dumps(asdict(verified) if verified else {}), "PASS" if passed else "FAILED", "verified external Shopify draft product" if passed else "external verification mismatch"))
-            if not passed:
-                conn.execute("INSERT INTO incidents(id, store_id, severity, summary, owner, state, evidence, verification_state) VALUES (?, ?, 'HIGH', ?, 'reliability_qa', 'OPEN', ?, 'VERIFIED')", (str(uuid.uuid4()), self.store_id, f"Shopify product verification failed for {created.id}", json.dumps([asdict(created), asdict(verified) if verified else None])))
-        return {"work_order_id": work_order_id, "status": "PASS" if passed else "FAILED", "shopify_product_id": created.id}
+        if not work:
+            raise KeyError(f"work order not found: {work_order_id}")
+        lease_owner = f"shopify_builder:{work_order_id}"
+        if not self.leases.acquire(self.store_id, work["resource"], lease_owner, ttl_seconds=120):
+            return {"work_order_id": work_order_id, "status": "BLOCKED", "reason": "resource is leased by another writer"}
+        try:
+            with self.db.transaction() as conn:
+                work = conn.execute("SELECT * FROM work_orders WHERE id=? AND store_id=?", (work_order_id, self.store_id)).fetchone()
+                product_id = work["resource"].split(":", 1)[1]
+                product = conn.execute("SELECT * FROM products WHERE id=? AND store_id=?", (product_id, self.store_id)).fetchone()
+                if not product: raise KeyError(f"product not found: {product_id}")
+                if product["shopify_product_id"]:
+                    verified = self.shopify.get_product(product["shopify_product_id"])
+                    if verified and verified.status == "DRAFT" and verified.title == product["title"]:
+                        return {"work_order_id": work_order_id, "status": "PASS", "shopify_product_id": verified.id, "idempotent": True}
+                conn.execute("UPDATE work_orders SET status='RUNNING', updated_at=CURRENT_TIMESTAMP WHERE id=?", (work_order_id,))
+            created = self.shopify.create_draft_product(product["title"])
+            with self.db.transaction() as conn:
+                conn.execute("UPDATE products SET shopify_product_id=?, state='SHOPIFY_DRAFT_CREATED', updated_at=CURRENT_TIMESTAMP WHERE id=?", (created.id, product_id))
+                conn.execute("UPDATE work_orders SET status='VERIFYING', updated_at=CURRENT_TIMESTAMP WHERE id=?", (work_order_id,))
+            verified = self.shopify.get_product(created.id)
+            passed = bool(verified and verified.id == created.id and verified.title == product["title"] and verified.status == "DRAFT")
+            with self.db.transaction() as conn:
+                conn.execute("UPDATE products SET state=?, verification_state=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", ("SHOPIFY_DRAFT_VERIFIED" if passed else "VERIFY_FAILED", "PASS" if passed else "FAILED", product_id))
+                conn.execute("UPDATE work_orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", ("PASS" if passed else "FAILED", work_order_id))
+                conn.execute("INSERT INTO execution_ledger(id, store_id, work_order_id, action, before_state, diff, after_state, verification_state, result) VALUES (?, ?, ?, 'SHOPIFY_DRAFT_CREATE', ?, ?, ?, ?, ?)", (str(uuid.uuid4()), self.store_id, work_order_id, json.dumps({"shopify_product_id": None}), json.dumps({"shopify_product_id": created.id}), json.dumps(asdict(verified) if verified else {}), "PASS" if passed else "FAILED", "verified external Shopify draft product" if passed else "external verification mismatch"))
+                if not passed:
+                    conn.execute("INSERT INTO incidents(id, store_id, severity, summary, owner, state, evidence, verification_state) VALUES (?, ?, 'HIGH', ?, 'reliability_qa', 'OPEN', ?, 'VERIFIED')", (str(uuid.uuid4()), self.store_id, f"Shopify product verification failed for {created.id}", json.dumps([asdict(created), asdict(verified) if verified else None])))
+            return {"work_order_id": work_order_id, "status": "PASS" if passed else "FAILED", "shopify_product_id": created.id}
+        finally:
+            self.leases.release(self.store_id, work["resource"], lease_owner)
