@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-agent-dropshipping-os"
+version = "0.1.0"
+description = "Local-first multi-agent dropshipping operating system with verified execution gates."
+requires-python = ">=3.11"
+authors = [{name = "botworkers"}]
+
+[project.scripts]
+dropship-os = "dropship_os.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["dropship_os*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
